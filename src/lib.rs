@@ -13,12 +13,13 @@
 
 use std::io::Write;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryFrom;
 use std::ops::{Add, Index, Range};
 use std::iter::{Fuse, FusedIterator};
-use std::{vec, mem, fmt, fmt::Debug};
+use std::{iter, vec, mem, fmt, fmt::Debug};
 use std::rc::Rc;
+use std::cmp::Ordering;
 
 use std::sync::Mutex;
 
@@ -185,17 +186,13 @@ type PartitionBucketLevel0<T> = Rc<Vec<Vec<Vec<(bool, Vec<T>)>>>>;
 type PartitionBucket<T> = PartitionBucketLevel0<T>;//Vec<Vec<PartitionBucketLevel0<T>>>;
 type Partition<T> = BTreeMap<PartitionBucket<T>, Vec<usize>>;
 
-lazy_static! {
-    static ref max_perm: Mutex<usize> = Mutex::new(0);
-}
-
 /// A directed multigraph.
 /// 
 /// This is effectively a superset of all the graph types available in Graphiti, allowing directed edges, multiple edges, and loops.
 /// 
 /// This type implements [`Eq`] to test equivalence as a labeled graph (not isomorpic equivalence).
 /// If you want to compare graphs based on isomorphism, use [`Self::get_isomorphism`].
-#[derive(PartialEq, Eq, Clone)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub struct MultiDigraph<T: Weight>(Vec<Vec<(usize, T)>>);
 impl<T: Weight> MultiDigraph<T> {
     /// Returns a new, empty graph.
@@ -350,15 +347,6 @@ impl<T: Weight> MultiDigraph<T> {
             morphism_dst.push(b.1.into_iter().permutations(k));
         }
 
-        {
-            let max = morphism_src.iter().map(|v| v.len()).max().unwrap();
-            let mut gmax = max_perm.lock().unwrap();
-            if max > *gmax {
-                std::io::stdout().lock().write_all(format!("new max perm: {}\n    for graph: {:?}\n\n", max, self).as_bytes()).unwrap();
-                *gmax = max;
-            }
-        }
-
         let mut morphism = Morphism(vec![0; self.order()]); // not yet a valid morphism
         for morphism_pieces in morphism_dst.into_iter().multi_cartesian_product() {
             debug_assert_eq!(morphism_src.len(), morphism_pieces.len());
@@ -498,6 +486,24 @@ fn test_morphism() {
     let mut gg = old_g.clone();
     gg.apply_morphism(&morph).unwrap();
     assert_eq!(gg, g2);
+
+    let mut g3 = Graph::with_order(9);
+    for e in &[(0,1), (1,2), (3,4), (4,5), (6,7), (7,8), (0,3), (3,6), (1,4), (4,7), (2,5), (5,8)] {
+        g3.add_edge(e.0, e.1, ()).unwrap()
+    }
+    {
+        let mut gg = g3.clone();
+        gg.apply_morphism(&Morphism::try_from(vec![1, 7, 0, 5, 8, 6, 3, 4, 2]).unwrap()).unwrap();
+        assert_eq!(gg.adjacency(0).unwrap().edges().map(|(v, _)| v).collect::<Vec<_>>(), vec![6, 7]);
+        assert_eq!(gg.adjacency(1).unwrap().edges().map(|(v, _)| v).collect::<Vec<_>>(), vec![5, 7]);
+        assert_eq!(gg.adjacency(2).unwrap().edges().map(|(v, _)| v).collect::<Vec<_>>(), vec![4, 6]);
+        assert_eq!(gg.adjacency(3).unwrap().edges().map(|(v, _)| v).collect::<Vec<_>>(), vec![4, 5]);
+        assert_eq!(gg.adjacency(4).unwrap().edges().map(|(v, _)| v).collect::<Vec<_>>(), vec![2, 3, 8]);
+        assert_eq!(gg.adjacency(5).unwrap().edges().map(|(v, _)| v).collect::<Vec<_>>(), vec![1, 3, 8]);
+        assert_eq!(gg.adjacency(6).unwrap().edges().map(|(v, _)| v).collect::<Vec<_>>(), vec![0, 2, 8]);
+        assert_eq!(gg.adjacency(7).unwrap().edges().map(|(v, _)| v).collect::<Vec<_>>(), vec![0, 1, 8]);
+        assert_eq!(gg.adjacency(8).unwrap().edges().map(|(v, _)| v).collect::<Vec<_>>(), vec![4, 5, 6, 7]);
+    }
 }
 #[test]
 fn test_bigger_morphism() {
@@ -571,7 +577,7 @@ fn test_no_default() {
 /// 
 /// This type implements [`Eq`] to test equivalence as a labeled graph (not isomorpic equivalence).
 /// If you want to compare graphs based on isomorphism, use [`Self::get_isomorphism`].
-#[derive(PartialEq, Eq, Clone)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub struct Graph<T: Weight>(MultiDigraph<T>);
 impl<T: Weight> Graph<T> {
     /// Returns a new, empty graph.
@@ -639,7 +645,7 @@ impl<T: Weight> Graph<T> {
     /// This iterator will never return two graphs which are isomorphic.
     pub fn unique(order: usize, edges: usize, weight: T) -> UniqueGraphs<T> {
         let edges = (0..order).combinations(2).combinations(edges).fuse();
-        UniqueGraphs { classes: Default::default(), order, edges, weight }
+        UniqueGraphs { done: Default::default(), order, edges, weight }
     }
 }
 impl<T: Weight> Default for Graph<T> {
@@ -654,7 +660,8 @@ impl<T: Weight + Debug> Debug for Graph<T> {
 }
 
 pub struct UniqueGraphs<T: Weight> {
-    classes: BTreeMap<Vec<(PartitionBucket<T>, usize)>, Vec<(Graph<T>, Partition<T>)>>,
+    // classes: BTreeMap<Vec<(PartitionBucket<T>, usize)>, Vec<(Graph<T>, Partition<T>)>>,
+    done: BTreeSet<Graph<T>>,
     order: usize,
     edges: Fuse<Combinations<Combinations<Range<usize>>>>,
     weight: T,
@@ -668,26 +675,218 @@ impl<T: Weight + Debug> Iterator for UniqueGraphs<T> {
             for e in edges {
                 g.add_edge(e[0], e[1], self.weight.clone()).unwrap();
             }
-            let g_part = g.0.partition();
-            let buckets: Vec<_> = g_part.iter().map(|x| (x.0.clone(), x.1.len())).collect();
-            match self.classes.get_mut(&buckets) {
-                None => { self.classes.insert(buckets, vec![(g.clone(), g_part)]); },
-                Some(others) => {
-                    if others.len() != 1 { std::io::stdout().lock().write_all(format!("others: {}\n", others.len()).as_bytes()).unwrap(); }
-
-                    for (other, other_part) in others.iter() {
-                        if g.0.get_isomorphism_partitioned(&other.0, &g_part, other_part).is_some() {
-                            continue 'next_graph;
-                        }
-                    }
-                    others.push((g.clone(), g_part));
-                }
+            let canon = Graph(canonize(&g.0));
+            if !self.done.contains(&canon) {
+                self.done.insert(canon);
+                return Some(g);
             }
+            // let g_part = g.0.partition();
+            // let buckets: Vec<_> = g_part.iter().map(|x| (x.0.clone(), x.1.len())).collect();
+            // match self.classes.get_mut(&buckets) {
+            //     None => { self.classes.insert(buckets, vec![(g.clone(), g_part)]); },
+            //     Some(others) => {
+            //         if others.len() != 1 { std::io::stdout().lock().write_all(format!("others: {}\n", others.len()).as_bytes()).unwrap(); }
+
+            //         for (other, other_part) in others.iter() {
+            //             if g.0.get_isomorphism_partitioned(&other.0, &g_part, other_part).is_some() {
+            //                 continue 'next_graph;
+            //             }
+            //         }
+            //         others.push((g.clone(), g_part));
+            //     }
+            // }
             //std::io::stdout().lock().write_all(format!("classes: {:?}\n", self.classes.len()).as_bytes()).unwrap();
-            return Some(g);
+            // return Some(g);
         }
         None
     }
+}
+
+// paper: http://www.math.unl.edu/~aradcliffe1/Papers/Canonical.pdf
+
+#[derive(Clone, Default)]
+struct OrderedPartition(Vec<BTreeSet<usize>>);
+impl OrderedPartition {
+    fn unit(n: usize) -> Self {
+        Self(vec![(0..n).collect()])
+    }
+    // fn is_finer_than(&self, other: &Self) -> bool {
+    //     if !self.0.iter().all(|v| other.0.iter().any(|w| v.is_subset(w))) { return false }
+
+    //     for (i, vi) in self.0.iter().enumerate() {
+    //         for (k, wk) in other.0.iter().enumerate() {
+    //             if !vi.is_subset(wk) { continue }
+
+    //             for vj in self.0[i..].iter() {
+    //                 for (l, wl) in other.0.iter().enumerate() {
+    //                     if vj.is_subset(wl) && k > l { return false }
+    //                 }
+    //             }
+    //         }
+    //     }
+
+    //     true
+    // }
+
+    fn deg<T: Weight>(g: &MultiDigraph<T>, v: usize, part: &BTreeSet<usize>) -> Vec<T> {
+        let mut res: Vec<_> = g.adjacency(v).unwrap().edges().filter_map(|(adj, w)| if part.contains(&adj) { Some(w.clone()) } else { None }).collect();
+        res.sort();
+        res
+    }
+    fn refine<T: Weight>(&self, g: &MultiDigraph<T>) -> OrderedPartition {
+        let mut t = self.clone();
+        loop {
+            let mut shatter_target = None; // MUST BE LEXICOGRAPHICALLY SMALLEST (i,j) PAIR
+            'shatter_target: for (i, vi) in t.0.iter().enumerate() {
+                for (j, vj) in t.0.iter().enumerate() {
+                    let mut iter = vi.iter();
+                    while let Some(v) = iter.next().copied() {
+                        for &w in iter.clone() {
+                            if Self::deg(g, v, vj) != Self::deg(g, w, vj) {
+                                shatter_target = Some((i, j));
+                                break 'shatter_target;
+                            }
+                        }
+                    }
+                }
+            }
+            match shatter_target {
+                None => return t,
+                Some((i, j)) => {
+                    let (vi, vj) = (&t.0[i], &t.0[j]);
+                    let viarr: Vec<_> = vi.iter().copied().collect();
+                    let degs: BTreeMap<usize, Vec<T>> = viarr.iter().map(|&v| (v, Self::deg(g, v, vj))).collect();
+
+                    let shatter_info: BTreeSet<_> = viarr.iter().map(|v| (&degs[v], *v)).collect();
+                    let mut shattered = vec![];
+                    let mut x = vec![];
+                    let mut current_deg = shatter_info.iter().next().unwrap().0;
+                    for &(deg_vj, v) in shatter_info.iter() { // GROUPS MUST BE IN DEGREE ORDER
+                        if deg_vj != current_deg {
+                            shattered.push(mem::take(&mut x));
+                            current_deg = deg_vj;
+                        }
+                        x.push(v);
+                    }
+                    if !x.is_empty() { shattered.push(x) }
+
+                    let mut old_t = mem::take(&mut t).0.into_iter();
+                    for _ in 0..i { t.0.push(old_t.next().unwrap()) }
+                    for x in shattered { t.0.push(x.into_iter().collect()) }
+                    t.0.extend(old_t.skip(1));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+macro_rules! make_partition {
+    ($($($e:literal)+)|*) => { OrderedPartition(vec![$(vec![$($e),+].into_iter().collect()),*]) }
+}
+
+#[test]
+fn test_refine() {
+    let mut g = Graph::with_order(9);
+    for e in &[(0,1), (1,2), (3,4), (4,5), (6,7), (7,8), (0,3), (3,6), (1,4), (4,7), (2,5), (5,8)] {
+        g.add_edge(e.0, e.1, ()).unwrap()
+    }
+
+    assert_eq!(OrderedPartition::unit(9).refine(&g.0).0, make_partition!(0 2 6 8|1 3 5 7|4).0);
+    assert_eq!(make_partition!(0|2 6 8|1 3 5 7|4).refine(&g.0).0, make_partition!(0|2 6|8|5 7|1 3|4).0);
+    assert_eq!(make_partition!(2|0 6 8|1 3 5 7|4).refine(&g.0).0, make_partition!(2|0 8|6|3 7|1 5|4).0);
+    assert_eq!(make_partition!(8|0 2 6|1 3 5 7|4).refine(&g.0).0, make_partition!(8|2 6|0|1 3|5 7|4).0);
+}
+
+fn canonize<T: Weight>(g: &MultiDigraph<T>) -> MultiDigraph<T> {
+    let mut queue = vec![OrderedPartition::unit(g.order()).refine(g)];
+    let mut best = None;
+
+    while let Some(p) = queue.pop() {
+        let mut best_split = None;
+        for (i, split) in p.0.iter().enumerate() {
+            if split.len() == 1 { continue }
+            match &best_split {
+                None => best_split = Some((i, split)),
+                Some((_, vi)) => if split.len() < vi.len() { best_split = Some((i, split)) },
+            }
+        }
+        match best_split {
+            Some((i, vi)) => for val in vi {
+                let a = iter::once(*val).collect();
+                let mut b = vi.clone();
+                b.remove(val);
+
+                let mut next_partition = OrderedPartition::default();
+                let mut vals = p.0.iter().cloned();
+                for _ in 0..i { next_partition.0.push(vals.next().unwrap()) }
+                next_partition.0.push(a);
+                next_partition.0.push(b);
+                next_partition.0.extend(vals.skip(1));
+
+                queue.push(next_partition.refine(g));
+            }
+            None => {
+                let mut morph = Morphism(vec![0; g.order()]);
+                for (i, vi) in p.0.iter().enumerate() {
+                    morph.0[*vi.iter().next().unwrap()] = i;
+                }
+
+                let mut applied = g.clone();
+                applied.apply_morphism(&morph).unwrap();
+
+                match &best {
+                    None => best = Some(applied),
+                    Some(prev) => if applied > *prev { best = Some(applied) }
+                }
+                
+            }
+        }
+    }
+
+    best.unwrap()
+}
+
+#[test]
+fn test_canon_disconnected() {
+    let mut a = Graph::with_order(5);
+    a.add_edge(0, 1, ()).unwrap();
+    a.add_edge(0, 2, ()).unwrap();
+
+    let mut b = Graph::with_order(5);
+    b.add_edge(0, 1, ()).unwrap();
+    b.add_edge(0, 3, ()).unwrap();
+
+    assert_ne!(a, b);
+    assert!(a.get_isomorphism(&b).is_some());
+    let canon_a = Graph(canonize(&a.0));
+    let canon_b = Graph(canonize(&b.0));
+    assert_eq!(canon_a, canon_b);
+}
+
+#[test]
+fn test_canonize() {
+    let mut g = Graph::with_order(9);
+    for e in &[(0,1), (1,2), (3,4), (4,5), (6,7), (7,8), (0,3), (3,6), (1,4), (4,7), (2,5), (5,8)] {
+        g.add_edge(e.0, e.1, ()).unwrap()
+    }
+
+    let canon = Graph(canonize(&g.0));
+    println!("\nCg  = {:?}\nCg = {:?}", g, canon);
+
+    let canon_canon = Graph(canonize(&canon.0));
+    println!("\nCCg = {:?}", canon_canon);
+    assert_eq!(canon, canon_canon);
+
+    let uniso: Vec<_> = Graph::unique(5, 2, ()).collect();
+    for pair in uniso.iter().combinations(2) {
+        if let Some(_) = pair[0].get_isomorphism(&pair[1]) {
+            println!("g1: {:?}", &pair[0]);
+            println!("g2: {:?}", &pair[1]);
+            panic!();
+        }
+    }
+    assert_eq!(uniso.len(), 2);
 }
 
 #[test]
@@ -695,5 +894,5 @@ fn test_unique_count() {
     assert_eq!(Graph::unique(1, 0, ()).count(), 1);
     assert_eq!(Graph::unique(5, 2, ()).count(), 2);
     assert_eq!(Graph::unique(5, 6, ()).count(), 6);
-    assert_eq!(Graph::unique(15, 6, ()).count(), 68);
+    // assert_eq!(Graph::unique(15, 6, ()).count(), 68);
 }
